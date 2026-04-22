@@ -78,6 +78,8 @@ class BlendMetadata:
     total_len: int
     recompute_indices: Optional[mx.array] = None   # filled after check layer
     cold_token_mask: Optional[mx.array] = None     # [total_len] bool
+    check_layer: int = 1
+    recompute_ratio: float = 0.15
 
     @property
     def chunk_boundaries(self) -> List[Tuple[int, int]]:
@@ -301,3 +303,256 @@ def build_blend_metadata(
     cold_mask = mx.array(cold_mask_list, dtype=mx.bool_)
 
     return BlendMetadata(chunks=chunks, total_len=total_len, cold_token_mask=cold_mask)
+
+
+# -----------------------------------------------------------------------------
+# Model monkey-patching (Llama + Qwen3)
+# -----------------------------------------------------------------------------
+#
+# Design: we replace `inner.__call__` on a per-instance basis (bound method).
+# When no BlendMetadata is attached to the cache, we delegate to the original
+# __call__ — so a patched model behaves byte-identically to unpatched when
+# the feature is disabled.
+#
+# When BlendMetadata is attached, we run a layerwise forward that:
+#   - runs each transformer block normally (MVP: full recompute, byte-identical
+#     output to no-blend; sparse optimization is a follow-up task once the
+#     benchmark flags a need for it),
+#   - after the check layer, reads the now-populated `cache[check_layer].keys`,
+#     compares against the same layer's cached-and-position-adjusted K from
+#     meta.chunks, runs HKVD scoring, and stores the indices on meta. This
+#     exercises the HKVD machinery and pins the exact positions that a
+#     future sparse path will refresh.
+#
+# Any exception in the blend path falls back to the original forward with
+# metadata cleared and the fallback counter incremented.
+
+_PATCHED_SENTINEL = "_cacheblend_patched"
+
+
+def _get_blend_metadata(cache) -> Optional[BlendMetadata]:
+    """Extract BlendMetadata from an mlx-lm cache list if present.
+
+    mlx-lm caches are lists; we stash metadata on the first entry.
+    """
+    if cache is None:
+        return None
+    if isinstance(cache, (list, tuple)):
+        if not cache:
+            return None
+        first = cache[0]
+    else:
+        first = cache
+    meta = getattr(first, "blend_metadata", None)
+    if isinstance(meta, BlendMetadata):
+        return meta
+    return None
+
+
+def _clear_blend_metadata(cache) -> None:
+    """Strip BlendMetadata so a subsequent fallback call doesn't re-enter."""
+    if cache is None:
+        return
+    entries = cache if isinstance(cache, (list, tuple)) else [cache]
+    for entry in entries:
+        if hasattr(entry, "blend_metadata"):
+            try:
+                delattr(entry, "blend_metadata")
+            except AttributeError:
+                pass
+
+
+def patch_model_for_cacheblend(model) -> None:
+    """Install CacheBlend's layerwise forward on an mlx-lm model.
+
+    Accepts the outer mlx-lm `Model` (the one load() returns) or the inner
+    `LlamaModel` / `Qwen3Model` — we locate the inner automatically.
+
+    The patch works by reassigning `inner.__class__` to a dynamically-created
+    subclass that overrides `__call__`. Python resolves `obj(...)` via the
+    type's `__call__`, not the instance attribute, so a per-instance method
+    rebind wouldn't take effect — the `__class__` swap is the idiomatic fix.
+
+    Idempotent: calling twice on the same instance is a no-op. Only the
+    passed instance is affected; other loaded models of the same architecture
+    keep their original behavior.
+
+    Supported architectures: LlamaModel (covers Llama family + architectures
+    that reuse LlamaModel such as Mistral), Qwen3Model. Both use the same
+    transformer-block layout; they differ only in Qwen3's q/k RMSNorm
+    applied before RoPE — which we don't need to special-case here because
+    we delegate per-layer forward to the block's original `__call__`.
+    """
+    inner = getattr(model, "model", model)
+    if getattr(type(inner), _PATCHED_SENTINEL, False):
+        return
+
+    original_cls = type(inner)
+    cls_name = original_cls.__name__
+    if cls_name not in ("LlamaModel", "Qwen3Model"):
+        raise NotImplementedError(
+            f"CacheBlend: no layerwise patch for model class {cls_name}. "
+            f"Supported: LlamaModel, Qwen3Model."
+        )
+
+    def blended_call(self, inputs, cache=None, *args, **kwargs):
+        meta = _get_blend_metadata(cache)
+        if meta is None:
+            return original_cls.__call__(self, inputs, cache, *args, **kwargs)
+        try:
+            return _run_blended_forward(self, inputs, cache, meta, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("CacheBlend layerwise forward failed; falling back: %s", exc)
+            record_fallback("layerwise_exception")
+            _clear_blend_metadata(cache)
+            return original_cls.__call__(self, inputs, cache, *args, **kwargs)
+
+    # Build a per-instance subclass so we affect only this model instance, not
+    # every LlamaModel in the process. `type()` creates a new class; the
+    # sentinel attr prevents double-wrapping on repeat patch calls.
+    blended_cls = type(
+        f"{cls_name}Blended",
+        (original_cls,),
+        {"__call__": blended_call, _PATCHED_SENTINEL: True},
+    )
+    inner.__class__ = blended_cls
+
+
+def _build_position_offsets(meta: BlendMetadata) -> mx.array:
+    """Per-token offset used to rotate each CACHED chunk's K into its new
+    absolute position. COLD tokens contribute 0 (their K will be computed
+    fresh at the correct position anyway).
+    """
+    offsets: List[int] = []
+    for chunk in meta.chunks:
+        if chunk.kind == CACHED:
+            offsets.extend([chunk.start_pos] * len(chunk.tokens))
+        else:
+            offsets.extend([0] * len(chunk.tokens))
+    return mx.array(offsets, dtype=mx.int32)
+
+
+def _gather_cached_k(meta: BlendMetadata, layer_idx: int, head_dim: int, num_kv_heads: int) -> mx.array:
+    """Concatenate per-chunk cached K for the given layer, with per-chunk
+    offset RoPE applied. COLD chunks contribute zeros (the cold_token_mask
+    forces them to recompute regardless of K-diff).
+
+    Returns shape [num_kv_heads, total_len, head_dim].
+    """
+    pieces: List[mx.array] = []
+    for chunk in meta.chunks:
+        n = len(chunk.tokens)
+        if chunk.kind == CACHED and chunk.cached_kv is not None:
+            k_chunk, _ = chunk.cached_kv.per_layer_kv[layer_idx]
+            # Cached K shape: [num_kv_heads, chunk_len, head_dim]. Rotate by
+            # the chunk's new absolute start position.
+            offsets = mx.array([chunk.start_pos] * n, dtype=mx.int32)
+            k_rot = rotate_k_by_offsets(k_chunk, offsets=offsets, head_dim=head_dim)
+            pieces.append(k_rot)
+        else:
+            pieces.append(mx.zeros((num_kv_heads, n, head_dim)))
+    return mx.concatenate(pieces, axis=1)
+
+
+def _run_blended_forward(inner, inputs, cache, meta: BlendMetadata, *args, **kwargs):
+    """Layerwise forward that plumbs BlendMetadata through the stack.
+
+    MVP behavior: each layer runs normally (full recompute), so model output
+    is byte-identical to the un-blended path. The HKVD scorer runs after the
+    check layer and stores its result on meta.recompute_indices for downstream
+    consumers (scheduler auto-warm, future sparse-attention optimization).
+
+    This keeps the correctness story dead simple — any quality regression vs.
+    full recompute is zero — while the integration surface (cache lookups,
+    metadata plumbing, per-chunk offset-RoPE, per-layer K diffing) is fully
+    exercised end-to-end. The sparse-attention optimization that delivers
+    the paper's speedup is deferred until a benchmark gate demands it.
+    """
+    from mlx_lm.models.base import create_attention_mask
+
+    input_embeddings = kwargs.get("input_embeddings")
+    if input_embeddings is not None:
+        h = input_embeddings
+    else:
+        h = inner.embed_tokens(inputs)
+
+    # Attention-mask construction differs slightly between Llama (which has
+    # fa_idx/swa_idx for hybrid full/sliding attention) and Qwen3 (single mask
+    # from cache[0]). Read the architecture off the inner model.
+    if hasattr(inner, "fa_idx"):
+        fa_mask = create_attention_mask(h, cache[inner.fa_idx])
+        swa_mask = None
+        if getattr(inner, "swa_idx", None) is not None:
+            swa_mask = create_attention_mask(
+                h, cache[inner.swa_idx], window_size=inner.sliding_window
+            )
+
+        def _mask_for(i):
+            return swa_mask if inner.layers[i].use_sliding else fa_mask
+    else:
+        base_mask = create_attention_mask(h, cache[0])
+
+        def _mask_for(i):
+            return base_mask
+
+    num_layers = len(inner.layers)
+    check_layer_idx = meta.check_layer
+    if not 0 <= check_layer_idx < num_layers:
+        # Out-of-range check layer is a config bug; fail fast so callers
+        # see it rather than silently running without HKVD.
+        raise ValueError(
+            f"cacheblend_check_layers[0]={check_layer_idx} is out of range for a "
+            f"{num_layers}-layer model"
+        )
+
+    for i in range(num_layers):
+        h = inner.layers[i](h, _mask_for(i), cache=cache[i])
+
+        if i == check_layer_idx:
+            _score_hkvd_at_check_layer(cache[i], meta, layer_idx=i)
+
+    return inner.norm(h)
+
+
+def _score_hkvd_at_check_layer(layer_cache, meta: BlendMetadata, layer_idx: int) -> None:
+    """Read fresh K from the just-populated cache, gather cached K per-chunk
+    with offset-RoPE, and store HKVD-selected indices on meta.
+
+    Caught-and-logged on failure: HKVD is instrumentation in this MVP, not a
+    correctness-critical step. If it fails, the rest of the forward still
+    produces correct output.
+    """
+    try:
+        k_fresh = layer_cache.keys
+        if k_fresh is None:
+            return
+        # mlx-lm's KVCache pre-allocates its buffer in 256-token increments
+        # (see mlx_lm/models/cache.py::KVCache.update_and_fetch). The true
+        # number of filled tokens is `cache.offset`; we must slice to it to
+        # avoid scoring against uninitialized tail slots.
+        valid_len = int(getattr(layer_cache, "offset", k_fresh.shape[-2]))
+        # Drop batch dim (we assume B=1 for the blend path) and trim to valid.
+        if k_fresh.ndim == 4:
+            k_fresh = k_fresh[0]
+        k_fresh = k_fresh[:, :valid_len, :]
+        num_kv_heads = k_fresh.shape[0]
+        total_len = k_fresh.shape[1]
+        head_dim = k_fresh.shape[2]
+
+        if total_len != meta.total_len:
+            # The cache contains more (or fewer) tokens than the blend metadata
+            # accounts for — likely an unexpected multi-batch or decode step.
+            # Skip scoring rather than produce nonsense.
+            return
+
+        k_cached = _gather_cached_k(meta, layer_idx, head_dim, num_kv_heads)
+        indices = hkvd_score(
+            k_fresh=k_fresh,
+            k_cached=k_cached,
+            cold_token_mask=meta.cold_token_mask,
+            recompute_ratio=meta.recompute_ratio,
+        )
+        meta.recompute_indices = indices
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cacheblend: HKVD scoring failed at layer %d: %s", layer_idx, exc)
+        record_fallback("nan_hkvd")
