@@ -121,3 +121,45 @@ def test_sparse_q_selected_against_full_kv_matches_dense_subset():
 
     expected = out_dense[:, selected, :]
     assert mx.allclose(out_sparse, expected, atol=1e-5).item()
+
+
+class _FakeTokenizer:
+    """Minimal tokenizer for split_prompt_on_separator tests."""
+    def __init__(self):
+        # Reserve a few pseudo-token ids for the separator tokens.
+        self.vocab = {"A": 1, "B": 2, "C": 3, "D": 4, "Q": 5, " ": 6, "#": 7}
+
+    def encode(self, s: str) -> list[int]:
+        # Character-level so tests are predictable.
+        return [self.vocab.setdefault(ch, len(self.vocab) + 1) for ch in s]
+
+
+def test_split_prompt_basic():
+    tok = _FakeTokenizer()
+    sep = " # # "
+    chunks, query_tokens = cacheblend.split_prompt_on_separator(
+        prompt="AAA # # BBB # # Q", tokenizer=tok, separator=sep,
+    )
+    # Expect 2 non-query chunks + 1 query suffix
+    assert [tok.encode("AAA"), tok.encode("BBB")] == chunks
+    assert query_tokens == tok.encode("Q")
+
+
+def test_split_prompt_no_separator_returns_none():
+    tok = _FakeTokenizer()
+    result = cacheblend.split_prompt_on_separator(
+        prompt="AAABBBQ", tokenizer=tok, separator=" # # ",
+    )
+    assert result is None
+
+
+def test_split_prompt_leading_and_trailing_separators_rejected():
+    tok = _FakeTokenizer()
+    # Leading separator: treat as no valid split, fall back.
+    assert cacheblend.split_prompt_on_separator(
+        prompt=" # # AAA # # Q", tokenizer=tok, separator=" # # ",
+    ) is None
+    # Trailing separator: zero-length query, reject.
+    assert cacheblend.split_prompt_on_separator(
+        prompt="AAA # # Q # # ", tokenizer=tok, separator=" # # ",
+    ) is None

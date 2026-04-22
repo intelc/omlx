@@ -216,3 +216,42 @@ def sparse_attn_selected_q(
     attn = mx.softmax(scores, axis=-1)
     out = attn @ v                                                # [H, S, D]
     return out
+
+
+# -----------------------------------------------------------------------------
+# Prompt splitting
+# -----------------------------------------------------------------------------
+
+
+def split_prompt_on_separator(
+    prompt: str,
+    tokenizer: Any,
+    separator: str,
+) -> Optional[Tuple[List[List[int]], List[int]]]:
+    """Split a prompt on the CacheBlend separator.
+
+    Returns (chunk_token_lists, query_tokens) on a clean split, else None.
+    None signals the caller to fall back to standard prefill (separator
+    not present, or prompt starts/ends with the separator).
+    """
+    if separator not in prompt:
+        record_fallback("no_separator")
+        return None
+
+    parts = prompt.split(separator)
+    # Require non-empty first chunk and non-empty query suffix.
+    if len(parts) < 2 or not parts[0].strip() or not parts[-1].strip():
+        record_fallback("tokenizer_split_misalign")
+        return None
+
+    chunk_texts = parts[:-1]
+    query_text = parts[-1]
+
+    chunks = [tokenizer.encode(c) for c in chunk_texts]
+    query_tokens = tokenizer.encode(query_text)
+
+    if any(len(c) == 0 for c in chunks) or len(query_tokens) == 0:
+        record_fallback("tokenizer_split_misalign")
+        return None
+
+    return chunks, query_tokens
