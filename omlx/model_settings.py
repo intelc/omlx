@@ -60,6 +60,11 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
+        cacheblend_enabled: Enable CacheBlend KV cache reuse.
+        cacheblend_recompute_ratio: Ratio of tokens to recompute (default 0.15).
+        cacheblend_check_layers: Layers to check for cache reuse (default [1]).
+        cacheblend_special_str: Special token sequence marker (default ' # # ').
+        cacheblend_chunk_min_tokens: Minimum tokens per chunk (default 32).
         dflash_enabled: Enable DFlash speculative decoding.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
         dflash_draft_quant_bits: Draft model quantization bits.
@@ -103,6 +108,13 @@ class ModelSettings:
     specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
+
+    # CacheBlend (KV cache reuse and selective recomputation)
+    cacheblend_enabled: bool = False
+    cacheblend_recompute_ratio: float = 0.15
+    cacheblend_check_layers: list[int] = field(default_factory=lambda: [1])
+    cacheblend_special_str: str = " # # "
+    cacheblend_chunk_min_tokens: int = 32
 
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False
