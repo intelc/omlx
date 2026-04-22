@@ -255,3 +255,49 @@ def split_prompt_on_separator(
         return None
 
     return chunks, query_tokens
+
+
+# -----------------------------------------------------------------------------
+# Chunk classification and blend metadata assembly
+# -----------------------------------------------------------------------------
+
+
+def build_blend_metadata(
+    chunk_token_lists: List[List[int]],
+    query_tokens: List[int],
+    prefix_cache: Any,
+    chunk_min_tokens: int,
+) -> Optional[BlendMetadata]:
+    """Classify each chunk as CACHED or COLD and compute blend metadata.
+
+    Returns None if every chunk is COLD (no reuse possible → fall back).
+    The query is always treated as a COLD chunk.
+    """
+    chunks: List[ChunkInfo] = []
+    pos = 0
+    any_cached = False
+
+    for tokens in chunk_token_lists:
+        handle = None
+        if len(tokens) >= chunk_min_tokens:
+            handle = prefix_cache.lookup_chunk_by_standalone_hash(tokens)
+        kind = CACHED if handle is not None else COLD
+        if kind == CACHED:
+            any_cached = True
+        chunks.append(ChunkInfo(tokens=tokens, kind=kind, start_pos=pos, cached_kv=handle))
+        pos += len(tokens)
+
+    chunks.append(ChunkInfo(tokens=query_tokens, kind=COLD, start_pos=pos, cached_kv=None))
+    pos += len(query_tokens)
+
+    if not any_cached:
+        record_fallback("no_chunks_cached")
+        return None
+
+    total_len = pos
+    cold_mask_list = []
+    for chunk in chunks:
+        cold_mask_list.extend([chunk.kind == COLD] * len(chunk.tokens))
+    cold_mask = mx.array(cold_mask_list, dtype=mx.bool_)
+
+    return BlendMetadata(chunks=chunks, total_len=total_len, cold_token_mask=cold_mask)

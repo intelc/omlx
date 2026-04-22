@@ -163,3 +163,47 @@ def test_split_prompt_leading_and_trailing_separators_rejected():
     assert cacheblend.split_prompt_on_separator(
         prompt="AAA # # Q # # ", tokenizer=tok, separator=" # # ",
     ) is None
+
+
+class _FakePrefixCache:
+    """Captures lookup_chunk_by_standalone_hash behavior for classify tests."""
+    def __init__(self, known_tokens_to_handle):
+        self._known = {tuple(k): v for k, v in known_tokens_to_handle.items()}
+
+    def lookup_chunk_by_standalone_hash(self, tokens):
+        return self._known.get(tuple(tokens))
+
+
+def test_classify_chunks_mixed_cached_and_cold():
+    class _Handle:
+        per_layer_kv = [(None, None)]
+    cache = _FakePrefixCache({(1, 2, 3): _Handle()})
+
+    meta = cacheblend.build_blend_metadata(
+        chunk_token_lists=[[1, 2, 3], [4, 5, 6, 7]],
+        query_tokens=[9, 9],
+        prefix_cache=cache,
+        chunk_min_tokens=1,
+    )
+
+    assert len(meta.chunks) == 3        # 2 doc chunks + 1 query chunk
+    assert meta.chunks[0].kind == cacheblend.CACHED
+    assert meta.chunks[1].kind == cacheblend.COLD
+    assert meta.chunks[2].kind == cacheblend.COLD    # query always cold
+    assert meta.chunks[0].start_pos == 0
+    assert meta.chunks[1].start_pos == 3
+    assert meta.chunks[2].start_pos == 7
+    assert meta.total_len == 9
+    # Cold mask: positions 3..8 are cold, 0..2 are cached
+    assert meta.cold_token_mask.tolist() == [False, False, False, True, True, True, True, True, True]
+
+
+def test_classify_chunks_all_cold_returns_none():
+    cache = _FakePrefixCache({})
+    meta = cacheblend.build_blend_metadata(
+        chunk_token_lists=[[1, 2, 3]],
+        query_tokens=[9],
+        prefix_cache=cache,
+        chunk_min_tokens=1,
+    )
+    assert meta is None   # signal to fall back to standard prefill
