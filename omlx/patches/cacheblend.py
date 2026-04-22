@@ -171,3 +171,48 @@ def rotate_k_by_offsets(
     rot_odd = k_even * sin[None, :, :] + k_odd * cos[None, :, :]
     out = mx.stack([rot_even, rot_odd], axis=-1)
     return out.reshape(k.shape)
+
+
+# -----------------------------------------------------------------------------
+# Sparse-Q attention: selected Q attends against full K/V with causal mask
+# -----------------------------------------------------------------------------
+
+
+def sparse_attn_selected_q(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    selected_q_indices: mx.array,
+    scale: float,
+) -> mx.array:
+    """Compute attention for a selected subset of Q tokens against full K/V.
+
+    CacheBlend's core primitive: for layers 2..N, only `selected_q_indices`
+    tokens get refreshed output, but each of them must still attend against
+    the full (cached + already-refreshed) K/V buffer.
+
+    Args:
+        q: [num_heads, total_len, head_dim]  — full Q (we'll slice).
+        k: [num_heads, total_len, head_dim]  — full blended K.
+        v: [num_heads, total_len, head_dim]  — full blended V.
+        selected_q_indices: [n_sel] int32, sorted ascending.
+        scale: attention scale (typically 1/sqrt(head_dim)).
+
+    Returns:
+        [num_heads, n_sel, head_dim] — attention output for the selected Q.
+    """
+    total_len = q.shape[1]
+    q_sel = q[:, selected_q_indices, :]                           # [H, S, D]
+    scores = (q_sel @ k.transpose(0, 2, 1)) * scale               # [H, S, T]
+
+    # Causal mask: selected row i at absolute position selected_q_indices[i]
+    # may attend to positions 0..selected_q_indices[i].
+    positions = mx.arange(total_len).astype(mx.int32)             # [T]
+    sel_pos = selected_q_indices.astype(mx.int32)[:, None]        # [S, 1]
+    allow = positions[None, :] <= sel_pos                         # [S, T]
+    mask = mx.where(allow, mx.array(0.0), mx.array(-1e9))         # [S, T]
+    scores = scores + mask[None, :, :]
+
+    attn = mx.softmax(scores, axis=-1)
+    out = attn @ v                                                # [H, S, D]
+    return out

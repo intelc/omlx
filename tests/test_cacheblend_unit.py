@@ -90,3 +90,34 @@ def test_rotate_k_by_offsets_matches_direct_computation():
     )
 
     assert mx.allclose(k_at_4_via_offset, k_at_4_direct, atol=1e-5).item()
+
+
+def test_sparse_q_selected_against_full_kv_matches_dense_subset():
+    """sparse_attn_selected_q(Q_selected, K_full, V_full) must equal
+    the corresponding rows of dense attention(Q_full, K_full, V_full)."""
+    num_heads = 4
+    total_len = 12
+    head_dim = 16
+    rng = np.random.default_rng(3)
+    q = mx.array(rng.normal(size=(num_heads, total_len, head_dim)).astype(np.float32))
+    k = mx.array(rng.normal(size=(num_heads, total_len, head_dim)).astype(np.float32))
+    v = mx.array(rng.normal(size=(num_heads, total_len, head_dim)).astype(np.float32))
+    scale = 1.0 / float(head_dim) ** 0.5
+
+    # Causal mask: shape [total_len, total_len], True = allow attend
+    allow = mx.tril(mx.ones((total_len, total_len), dtype=mx.bool_))
+    mask_full = mx.where(allow, mx.array(0.0), mx.array(-1e9))   # additive
+
+    scores_full = (q @ k.transpose(0, 2, 1)) * scale + mask_full
+    attn_full = mx.softmax(scores_full, axis=-1)
+    out_dense = attn_full @ v   # [H, T, D]
+
+    selected = mx.array([3, 7, 11], dtype=mx.int32)
+    out_sparse = cacheblend.sparse_attn_selected_q(
+        q=q, k=k, v=v,
+        selected_q_indices=selected,
+        scale=scale,
+    )
+
+    expected = out_dense[:, selected, :]
+    assert mx.allclose(out_sparse, expected, atol=1e-5).item()
