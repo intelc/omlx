@@ -44,3 +44,49 @@ def test_hkvd_score_always_includes_cold_tokens():
     )
 
     assert 3 in indices.tolist()
+
+
+def test_rotate_k_by_offsets_matches_direct_computation():
+    """K rotated by offset θ at position 0 should equal K computed fresh at position θ.
+
+    Uses a simple RoPE implementation inline to avoid depending on the
+    model's rotary module. CacheBlend's production path uses the model's
+    own rotary; this test validates the generalization math.
+    """
+    head_dim = 32
+    num_heads = 2
+    total_len = 6
+
+    rng = np.random.default_rng(7)
+    x = mx.array(rng.normal(size=(num_heads, total_len, head_dim)).astype(np.float32))
+
+    def apply_rope_at(x, start_pos):
+        # Rotate pairs (2i, 2i+1) by angle m * theta_i; theta_i = base^(-2i/d)
+        base = 10000.0
+        d = x.shape[-1]
+        positions = mx.arange(start_pos, start_pos + x.shape[1]).astype(mx.float32)
+        inv_freq = base ** (-mx.arange(0, d, 2).astype(mx.float32) / d)
+        freqs = positions[:, None] * inv_freq[None, :]   # [T, d/2]
+        cos = mx.cos(freqs)                              # [T, d/2]
+        sin = mx.sin(freqs)
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        rot_even = x_even * cos - x_odd * sin
+        rot_odd = x_even * sin + x_odd * cos
+        out = mx.stack([rot_even, rot_odd], axis=-1)
+        return out.reshape(x.shape)
+
+    # Cached case: K was RoPE'd at position 0; we want it rotated to position 4.
+    k_at_0 = apply_rope_at(x, start_pos=0)
+    k_at_4_direct = apply_rope_at(x, start_pos=4)
+
+    # Re-rotate k_at_0 by +4 using the offset utility
+    offsets = mx.array([4] * total_len, dtype=mx.int32)
+    k_at_4_via_offset = cacheblend.rotate_k_by_offsets(
+        k=k_at_0,
+        offsets=offsets,
+        head_dim=head_dim,
+        base=10000.0,
+    )
+
+    assert mx.allclose(k_at_4_via_offset, k_at_4_direct, atol=1e-5).item()

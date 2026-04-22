@@ -125,3 +125,49 @@ def hkvd_score(
 
     top = mx.argsort(-score)[:k]
     return mx.sort(top)
+
+
+# -----------------------------------------------------------------------------
+# Per-chunk offset-RoPE
+# -----------------------------------------------------------------------------
+
+
+def rotate_k_by_offsets(
+    k: mx.array,
+    offsets: mx.array,
+    head_dim: int,
+    base: float = 10000.0,
+) -> mx.array:
+    """Rotate each token's K by its per-token position offset.
+
+    Cached K was rotated at position 0. When that chunk lands at absolute
+    position `offset` in a new blended sequence, its K needs to be rotated
+    by an *additional* `offset` angle (RoPE composition: rotating by a,
+    then by b, equals rotating by a+b).
+
+    Args:
+        k: [num_heads, total_len, head_dim]
+        offsets: [total_len] int32 — per-token additional offset to apply.
+            For tokens that should NOT be rotated (e.g. COLD tokens whose
+            K will be freshly computed anyway), pass 0.
+        head_dim: rotary dimension.
+        base: RoPE base (typically 10000 for Llama/Qwen3; override per-arch).
+
+    Returns:
+        [num_heads, total_len, head_dim] — rotated K.
+    """
+    d = head_dim
+    if d % 2 != 0:
+        raise ValueError(f"rotate_k_by_offsets requires even head_dim, got {d}")
+
+    inv_freq = base ** (-mx.arange(0, d, 2).astype(mx.float32) / d)    # [d/2]
+    freqs = offsets.astype(mx.float32)[:, None] * inv_freq[None, :]    # [T, d/2]
+    cos = freqs.cos()
+    sin = freqs.sin()
+
+    k_even = k[..., 0::2]      # [H, T, d/2]
+    k_odd = k[..., 1::2]
+    rot_even = k_even * cos[None, :, :] - k_odd * sin[None, :, :]
+    rot_odd = k_even * sin[None, :, :] + k_odd * cos[None, :, :]
+    out = mx.stack([rot_even, rot_odd], axis=-1)
+    return out.reshape(k.shape)
