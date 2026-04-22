@@ -82,3 +82,46 @@ class BlendMetadata:
     @property
     def chunk_boundaries(self) -> List[Tuple[int, int]]:
         return [(c.start_pos, c.start_pos + len(c.tokens)) for c in self.chunks]
+
+
+# -----------------------------------------------------------------------------
+# HKVD scorer
+# -----------------------------------------------------------------------------
+
+
+def hkvd_score(
+    k_fresh: mx.array,
+    k_cached: mx.array,
+    cold_token_mask: mx.array,
+    recompute_ratio: float,
+) -> mx.array:
+    """Rank tokens by K-deviation and return indices to recompute.
+
+    Args:
+        k_fresh: [num_heads, total_len, head_dim] — freshly computed K at
+            the check layer, with correct absolute-position RoPE applied.
+        k_cached: [num_heads, total_len, head_dim] — K pulled from the
+            blended chunk caches, position-fix-up already applied for
+            CACHED tokens. For COLD tokens the value is ignored (mask
+            forces selection).
+        cold_token_mask: [total_len] bool — True for tokens in COLD chunks.
+        recompute_ratio: float in (0, 1].
+
+    Returns:
+        mx.array of int indices, sorted ascending, to recompute on
+        subsequent layers. Always a superset of the COLD tokens.
+    """
+    total_len = k_fresh.shape[1]
+    # Per-token squared L2 diff averaged across heads and feature dims.
+    diff = (k_fresh.astype(mx.float32) - k_cached.astype(mx.float32)) ** 2
+    score = mx.mean(diff, axis=(0, 2))  # [total_len]
+    score = mx.where(cold_token_mask, mx.array(float("inf"), dtype=mx.float32), score)
+
+    k = max(1, int(total_len * recompute_ratio))
+    # Ensure k covers all COLD tokens even if the ratio is small.
+    num_cold = int(mx.sum(cold_token_mask.astype(mx.int32)).item())
+    k = max(k, num_cold)
+    k = min(k, total_len)
+
+    top = mx.argsort(-score)[:k]
+    return mx.sort(top)
