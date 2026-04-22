@@ -46,6 +46,16 @@ class BlockCacheEntry:
     last_access: float
 
 
+@dataclass
+class _ChunkKVHandle:
+    """Return type for lookup_chunk_by_standalone_hash.
+
+    Holds the per-layer (K, V) tensors concatenated across the chunk's blocks,
+    trimmed to the exact token length (last block may be partial).
+    """
+    per_layer_kv: List[Tuple["mx.array", "mx.array"]]
+
+
 class BlockAwarePrefixCache(CacheManager):
     """
     Prefix cache that uses PagedCacheManager for block-based storage.
@@ -2257,3 +2267,101 @@ class BlockAwarePrefixCache(CacheManager):
             Maximum number of blocks from the underlying PagedCacheManager.
         """
         return self.paged_cache.max_blocks
+
+    # -------------------------------------------------------------------
+    # CacheBlend: standalone-hash chunk lookup
+    # -------------------------------------------------------------------
+
+    def _compute_standalone_block_hashes(self, tokens: List[int]) -> List[bytes]:
+        """Return the block-hash chain for `tokens` as-if standalone (parent=b'')."""
+        block_size = self.paged_cache.block_size
+        model_name = getattr(self.paged_cache, "model_name", None)
+        hashes: List[bytes] = []
+        parent: Optional[bytes] = None
+        for start in range(0, len(tokens), block_size):
+            block_tokens = tokens[start:start + block_size]
+            h = compute_block_hash(parent, block_tokens, model_name=model_name)
+            hashes.append(h)
+            parent = h
+        return hashes
+
+    def lookup_chunk_by_standalone_hash(self, tokens: List[int]) -> Optional["_ChunkKVHandle"]:
+        """Look up a chunk's per-layer K/V as if it were a root-parented prefix.
+
+        Walks block-by-block with parent_hash = b'' at the start, following
+        the same compute_block_hash recurrence used during insertion. Returns
+        None if the SSD cache is not configured or if any required block is
+        missing (partial hits not supported in MVP).
+        """
+        if self.paged_ssd_cache is None:
+            return None
+
+        hashes = self._compute_standalone_block_hashes(tokens)
+        block_size = self.paged_cache.block_size
+
+        per_block_kvs: List[List[Tuple[Any, Any]]] = []
+        for h in hashes:
+            kv = self.paged_ssd_cache.load_block(h)
+            if kv is None:
+                return None
+            per_block_kvs.append(kv)
+
+        if not HAS_MLX:
+            raise RuntimeError("mlx.core is required for lookup_chunk_by_standalone_hash")
+
+        # Concatenate per-layer slices across blocks, trim last block to
+        # the actual remaining token count.
+        num_layers = len(per_block_kvs[0])
+        out_layers: List[Tuple[Any, Any]] = []
+        total = len(tokens)
+        for layer_idx in range(num_layers):
+            ks, vs = [], []
+            remaining = total
+            for i, blk in enumerate(per_block_kvs):
+                k, v = blk[layer_idx]
+                # Block tensors are shape [num_heads, block_token_count, head_dim].
+                take = min(remaining, k.shape[1])
+                ks.append(k[:, :take, :])
+                vs.append(v[:, :take, :])
+                remaining -= take
+                if remaining == 0:
+                    break
+            out_layers.append((mx.concatenate(ks, axis=1), mx.concatenate(vs, axis=1)))
+        return _ChunkKVHandle(per_layer_kv=out_layers)
+
+    def commit_chunk_as_standalone(
+        self,
+        tokens: List[int],
+        per_layer_kv: List[Tuple[Any, Any]],
+    ) -> bool:
+        """Insert a freshly-computed chunk's K/V into the SSD cache as if it
+        had been a root-parented prefix, so subsequent requests can find it
+        by `lookup_chunk_by_standalone_hash`.
+
+        Returns True if all blocks were enqueued for SSD persistence,
+        False if SSD cache is unconfigured or any save_block failed.
+        """
+        if self.paged_ssd_cache is None:
+            return False
+
+        hashes = self._compute_standalone_block_hashes(tokens)
+        block_size = self.paged_cache.block_size
+        model_name = getattr(self.paged_cache, "model_name", "") or ""
+
+        total = len(tokens)
+        for i, h in enumerate(hashes):
+            start = i * block_size
+            end = min(start + block_size, total)
+            token_count = end - start
+            block_cache_data = [
+                (k[:, start:end, :], v[:, start:end, :]) for (k, v) in per_layer_kv
+            ]
+            ok = self.paged_ssd_cache.save_block(
+                block_hash=h,
+                cache_data=block_cache_data,
+                token_count=token_count,
+                model_name=model_name,
+            )
+            if not ok:
+                return False
+        return True
