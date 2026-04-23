@@ -185,6 +185,17 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: Optional[float] = None
     # SpecPrefill: per-request threshold override (min tokens to trigger, None = use model setting)
     specprefill_threshold: Optional[int] = None
+    # CacheBlend: per-request enable (None = off). When True, the scheduler
+    # splits the prompt on cacheblend_special_str and reuses any chunks
+    # already committed to the standalone-hash side of the prefix cache.
+    cacheblend: Optional[bool] = None
+    # CacheBlend: per-request recompute ratio (default 0.15). Fraction of
+    # tokens re-projected at each layer beyond the check layer.
+    cacheblend_recompute_ratio: Optional[float] = None
+    # CacheBlend: per-request separator override (default " # # ").
+    cacheblend_special_str: Optional[str] = None
+    # CacheBlend: per-request minimum chunk length in tokens (default 32).
+    cacheblend_chunk_min_tokens: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
 

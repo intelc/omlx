@@ -2115,6 +2115,25 @@ async def create_chat_completion(
     elif _server_state.settings_manager and ms.specprefill_threshold is not None:
         chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
 
+    # CacheBlend: per-request overrides (fall back to model_settings).
+    # Request fields come from ChatCompletionRequest in omlx/api/openai_models.py.
+    if getattr(request, "cacheblend", None) is not None:
+        chat_kwargs["cacheblend"] = request.cacheblend
+    elif _server_state.settings_manager and getattr(ms, "cacheblend_enabled", False):
+        chat_kwargs["cacheblend"] = True
+    if getattr(request, "cacheblend_recompute_ratio", None) is not None:
+        chat_kwargs["cacheblend_recompute_ratio"] = request.cacheblend_recompute_ratio
+    elif _server_state.settings_manager and getattr(ms, "cacheblend_recompute_ratio", None) is not None:
+        chat_kwargs["cacheblend_recompute_ratio"] = ms.cacheblend_recompute_ratio
+    if getattr(request, "cacheblend_special_str", None) is not None:
+        chat_kwargs["cacheblend_special_str"] = request.cacheblend_special_str
+    elif _server_state.settings_manager and getattr(ms, "cacheblend_special_str", None) is not None:
+        chat_kwargs["cacheblend_special_str"] = ms.cacheblend_special_str
+    if getattr(request, "cacheblend_chunk_min_tokens", None) is not None:
+        chat_kwargs["cacheblend_chunk_min_tokens"] = request.cacheblend_chunk_min_tokens
+    elif _server_state.settings_manager and getattr(ms, "cacheblend_chunk_min_tokens", None) is not None:
+        chat_kwargs["cacheblend_chunk_min_tokens"] = ms.cacheblend_chunk_min_tokens
+
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
