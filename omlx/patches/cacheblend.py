@@ -822,6 +822,7 @@ def try_cacheblend_prefill(
     prefix_cache,
     settings,
     cache=None,
+    tokenizer=None,
 ) -> bool:
     """Pre-prefill hook. Returns True if blend was set up for this request,
     False if the caller should proceed with standard prefill.
@@ -852,9 +853,14 @@ def try_cacheblend_prefill(
             "CacheBlend and SpecPrefill cannot both be enabled for the same request"
         )
 
+    tok = tokenizer if tokenizer is not None else getattr(request, "tokenizer", None)
+    if tok is None:
+        record_fallback("tokenizer_split_misalign")
+        return False
+
     split = split_prompt_on_separator(
         prompt=request.prompt,
-        tokenizer=request.tokenizer,
+        tokenizer=tok,
         separator=settings.cacheblend_special_str,
     )
     if split is None:

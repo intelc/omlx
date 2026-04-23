@@ -2404,17 +2404,38 @@ class Scheduler:
         self._try_specprefill_scoring(request)
 
         # CacheBlend: attempt blended prefill before falling into the standard
-        # prefill path. No-op if disabled or prompt has no separator.
+        # prefill path. No-op if the request didn't opt in or the prompt has
+        # no separator. Per-request attributes are set by engine_core's
+        # add_request (mirrors _specprefill_enabled). We build a synthetic
+        # settings object so try_cacheblend_prefill stays agnostic to where
+        # the knobs came from (per-request override vs. global ModelSettings).
         try:
-            from .patches.cacheblend import try_cacheblend_prefill
-            model_settings = getattr(request, "model_settings", None)
-            if model_settings is not None:
+            if getattr(request, "_cacheblend_enabled", False):
+                import types as _types
+                from .patches.cacheblend import try_cacheblend_prefill
+                settings = _types.SimpleNamespace(
+                    cacheblend_enabled=True,
+                    cacheblend_recompute_ratio=getattr(
+                        request, "_cacheblend_recompute_ratio", 0.15
+                    ),
+                    cacheblend_check_layers=[1],
+                    cacheblend_special_str=getattr(
+                        request, "_cacheblend_special_str", " # # "
+                    ),
+                    cacheblend_chunk_min_tokens=getattr(
+                        request, "_cacheblend_chunk_min_tokens", 32
+                    ),
+                    specprefill_enabled=getattr(
+                        request, "_specprefill_enabled", False
+                    ),
+                )
                 try_cacheblend_prefill(
                     request=request,
                     model=self.model,
                     prefix_cache=getattr(self, "block_aware_cache", None),
-                    settings=model_settings,
+                    settings=settings,
                     cache=getattr(request, "prompt_cache", None),
+                    tokenizer=self.tokenizer,
                 )
         except Exception:  # noqa: BLE001
             # CacheBlend should never crash a request; fall back silently.

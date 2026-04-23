@@ -259,6 +259,10 @@ class EngineCore:
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
+        cacheblend: Optional[bool] = None,
+        cacheblend_recompute_ratio: Optional[float] = None,
+        cacheblend_special_str: Optional[str] = None,
+        cacheblend_chunk_min_tokens: Optional[int] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -275,6 +279,16 @@ class EngineCore:
             specprefill: Per-request SpecPrefill override (True/False/None)
             specprefill_keep_pct: Per-request keep rate override
             specprefill_threshold: Per-request threshold override (min tokens)
+            cacheblend: Per-request CacheBlend override. When True the scheduler
+                tries to split the prompt on the separator string and reuse any
+                chunks it finds already committed to the standalone-hash side
+                of the prefix cache. Safe to leave None.
+            cacheblend_recompute_ratio: Override the fraction of tokens the
+                HKVD scorer refreshes each layer (default 0.15).
+            cacheblend_special_str: Override the chunk-separator token string
+                (default " # # ").
+            cacheblend_chunk_min_tokens: Chunks shorter than this skip the
+                blend path — blend overhead outweighs savings on tiny chunks.
 
         Returns:
             The request ID
@@ -311,6 +325,20 @@ class EngineCore:
             request._specprefill_threshold = specprefill_threshold
         if specprefill_system_end is not None and specprefill_system_end > 0:
             request.specprefill_system_end = specprefill_system_end
+
+        # CacheBlend: resolve per-request settings (mirrors the SpecPrefill
+        # pattern above). The scheduler's pre-prefill hook reads these off
+        # the request and, when _cacheblend_enabled is truthy, attempts to
+        # split the prompt on the separator and attach BlendMetadata to the
+        # per-layer cache objects.
+        if cacheblend is not None:
+            request._cacheblend_enabled = cacheblend
+        if cacheblend_recompute_ratio is not None:
+            request._cacheblend_recompute_ratio = cacheblend_recompute_ratio
+        if cacheblend_special_str is not None:
+            request._cacheblend_special_str = cacheblend_special_str
+        if cacheblend_chunk_min_tokens is not None:
+            request._cacheblend_chunk_min_tokens = cacheblend_chunk_min_tokens
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)
