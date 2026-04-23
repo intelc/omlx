@@ -555,6 +555,47 @@ def _run_blended_forward(inner, inputs, cache, meta: BlendMetadata, *args, **kwa
     return inner.norm(h)
 
 
+def _rope_at_per_token_positions(
+    x: mx.array,
+    freqs: mx.array,
+    positions: mx.array,
+    traditional: bool,
+) -> mx.array:
+    """Apply RoPE to x at per-token absolute positions using the given freqs.
+
+    `freqs`: the inv-freqs (periods) from the model's rotary, shape [head_dim/2].
+             angle[j, i] = positions[j] / freqs[i].
+    `positions`: [n_sel] int32 — one absolute position per token in `x`.
+    `traditional`: if True, rotate adjacent pairs (dims 0/1, 2/3, …);
+                   if False, rotate halves (dims [:d/2] paired with [d/2:]).
+
+    mlx-lm exposes `mx.fast.rope` with scalar or 1-element `offset` only, so
+    non-contiguous per-token positions can't go through the fused kernel.
+    This helper replicates the same math via explicit cos/sin + rotation
+    so we can project Q at only the selected tokens.
+    """
+    d = x.shape[-1]
+    angles = (
+        positions.astype(mx.float32)[:, None] / freqs.astype(mx.float32)[None, :]
+    )
+    cos = angles.cos().astype(x.dtype)
+    sin = angles.sin().astype(x.dtype)
+    if traditional:
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        rot_even = x_even * cos - x_odd * sin
+        rot_odd = x_even * sin + x_odd * cos
+        out = mx.stack([rot_even, rot_odd], axis=-1)
+        return out.reshape(x.shape)
+    # half-and-half layout (Llama-3, Qwen3)
+    half = d // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    r1 = x1 * cos - x2 * sin
+    r2 = x1 * sin + x2 * cos
+    return mx.concatenate([r1, r2], axis=-1)
+
+
 def _sparse_layer_forward(layer, h: mx.array, mask, layer_cache, recompute_indices: mx.array) -> mx.array:
     """Transformer-block forward with sparse attention + sparse MLP.
 
@@ -577,30 +618,55 @@ def _sparse_layer_forward(layer, h: mx.array, mask, layer_cache, recompute_indic
     B, L, D = h.shape
     n_sel = recompute_indices.shape[0]
 
-    # --- Full-width projections + RoPE (kept dense for cache correctness) ---
+    # --- K/V: full-width projections (cache needs K/V at every position so
+    # downstream layers and decode continuations can attend correctly) ---
     x_ln = layer.input_layernorm(h)
-    q = attn.q_proj(x_ln)
     k = attn.k_proj(x_ln)
     v = attn.v_proj(x_ln)
-
-    # Qwen3 applies q_norm/k_norm between reshape and transpose; Llama doesn't.
-    if hasattr(attn, "q_norm"):
-        q = attn.q_norm(q.reshape(B, L, attn.n_heads, -1)).transpose(0, 2, 1, 3)
+    if hasattr(attn, "k_norm"):
         k = attn.k_norm(k.reshape(B, L, attn.n_kv_heads, -1)).transpose(0, 2, 1, 3)
     else:
-        q = q.reshape(B, L, attn.n_heads, -1).transpose(0, 2, 1, 3)
         k = k.reshape(B, L, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
     v = v.reshape(B, L, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
-
-    q = attn.rope(q, offset=layer_cache.offset)
     k = attn.rope(k, offset=layer_cache.offset)
-
-    # Populate the cache with fresh K/V at all positions — the downstream
-    # layers read this, and any future decode continuation needs it too.
     keys, values = layer_cache.update_and_fetch(k, v)
 
-    # --- Sparse attention: Q[I] @ K_full, V_full, causal at absolute pos ---
-    q_sel = q[:, :, recompute_indices, :]               # [B, n_heads, n_sel, head_dim]
+    # --- Q: sparse projection when we can rotate by per-token positions. ---
+    # Q is only consumed at the selected rows, so projecting only on the
+    # selected input slice shrinks this step from O(L*D^2) to O(|I|*D^2).
+    # The fallback path (dense Q projection + slice) runs when the rope
+    # doesn't expose its inv-freqs — we keep it for rope variants we
+    # haven't validated per-token rotation against.
+    rope_freqs = getattr(attn.rope, "_freqs", None)
+    rope_traditional = getattr(attn.rope, "traditional", False)
+    sel_positions = recompute_indices.astype(mx.int32) + layer_cache.offset - L
+    # Important: layer_cache.offset is now L after update_and_fetch above.
+    # Subtracting L gives positions relative to prefill start, then adding
+    # back layer_cache.offset - L (= 0 on a fresh prefill) — in other words
+    # at the clean prefill case `sel_positions == recompute_indices`. The
+    # arithmetic stays correct under a decode continuation too (offset > L
+    # shifts the selected positions into the global stream).
+    if rope_freqs is not None:
+        h_sel = h[:, recompute_indices, :]                           # [B, n_sel, D]
+        x_ln_sel = layer.input_layernorm(h_sel)
+        q_sel_raw = attn.q_proj(x_ln_sel)
+        if hasattr(attn, "q_norm"):
+            q_sel = attn.q_norm(
+                q_sel_raw.reshape(B, n_sel, attn.n_heads, -1)
+            ).transpose(0, 2, 1, 3)
+        else:
+            q_sel = q_sel_raw.reshape(B, n_sel, attn.n_heads, -1).transpose(0, 2, 1, 3)
+        q_sel = _rope_at_per_token_positions(
+            q_sel, rope_freqs, sel_positions, traditional=rope_traditional,
+        )
+    else:
+        q = attn.q_proj(x_ln)
+        if hasattr(attn, "q_norm"):
+            q = attn.q_norm(q.reshape(B, L, attn.n_heads, -1)).transpose(0, 2, 1, 3)
+        else:
+            q = q.reshape(B, L, attn.n_heads, -1).transpose(0, 2, 1, 3)
+        q = attn.rope(q, offset=layer_cache.offset - L)
+        q_sel = q[:, :, recompute_indices, :]
 
     # Causal mask at absolute positions: row j (Q at recompute_indices[j])
     # may attend to K columns up to recompute_indices[j].
@@ -609,7 +675,7 @@ def _sparse_layer_forward(layer, h: mx.array, mask, layer_cache, recompute_indic
     sel_pos = recompute_indices.astype(mx.int32)[:, None]
     allow = positions[None, :] <= sel_pos               # [n_sel, T]
     add_mask = mx.where(
-        allow, mx.array(0.0, dtype=q.dtype), mx.array(-1e9, dtype=q.dtype)
+        allow, mx.array(0.0, dtype=q_sel.dtype), mx.array(-1e9, dtype=q_sel.dtype)
     )                                                    # [n_sel, T]
 
     # Fused attention kernel. mx.fast.SDPA handles GQA (keys/values with
