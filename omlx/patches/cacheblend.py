@@ -556,3 +556,76 @@ def _score_hkvd_at_check_layer(layer_cache, meta: BlendMetadata, layer_idx: int)
     except Exception as exc:  # noqa: BLE001
         logger.warning("cacheblend: HKVD scoring failed at layer %d: %s", layer_idx, exc)
         record_fallback("nan_hkvd")
+
+
+# -----------------------------------------------------------------------------
+# Scheduler pre-prefill hook
+# -----------------------------------------------------------------------------
+
+
+def try_cacheblend_prefill(
+    request,
+    model,
+    prefix_cache,
+    settings,
+    cache=None,
+) -> bool:
+    """Pre-prefill hook. Returns True if blend was set up for this request,
+    False if the caller should proceed with standard prefill.
+
+    Side effects on True:
+      - patch_model_for_cacheblend(model) is applied (idempotent).
+      - BlendMetadata is attached to each per-layer cache entry, so the
+        patched model's __call__ will take the blended path.
+
+    Parameters follow the scheduler's own attribute names:
+      request.prompt              — the full prompt string
+      request.tokenizer           — the tokenizer object (has .encode)
+      cache                       — list of per-layer KV caches for this request
+                                    (passed separately because request.cache does
+                                    not exist at add_request time; the scheduler
+                                    uses request.prompt_cache).
+      settings.cacheblend_enabled, .cacheblend_recompute_ratio, etc.
+
+    If cache is None, falls back to request.cache for callers that do attach
+    a .cache attribute directly.
+    """
+    if not getattr(settings, "cacheblend_enabled", False):
+        return False
+
+    if getattr(request, "_specprefill_enabled", False) and getattr(settings, "specprefill_enabled", False):
+        record_fallback("specprefill_conflict")
+        raise ValueError(
+            "CacheBlend and SpecPrefill cannot both be enabled for the same request"
+        )
+
+    split = split_prompt_on_separator(
+        prompt=request.prompt,
+        tokenizer=request.tokenizer,
+        separator=settings.cacheblend_special_str,
+    )
+    if split is None:
+        return False
+
+    chunks, query = split
+    meta = build_blend_metadata(
+        chunk_token_lists=chunks,
+        query_tokens=query,
+        prefix_cache=prefix_cache,
+        chunk_min_tokens=settings.cacheblend_chunk_min_tokens,
+    )
+    if meta is None:
+        return False
+
+    meta.recompute_ratio = settings.cacheblend_recompute_ratio
+    check_layers = getattr(settings, "cacheblend_check_layers", None) or [1]
+    meta.check_layer = int(check_layers[0])
+
+    # Resolve the cache list: explicit arg takes priority, then request attr.
+    resolved_cache = cache if cache is not None else getattr(request, "cache", None)
+
+    patch_model_for_cacheblend(model)
+    if resolved_cache is not None:
+        for layer_cache in resolved_cache:
+            layer_cache.blend_metadata = meta
+    return True

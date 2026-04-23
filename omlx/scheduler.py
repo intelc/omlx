@@ -2403,6 +2403,23 @@ class Scheduler:
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
         self._try_specprefill_scoring(request)
 
+        # CacheBlend: attempt blended prefill before falling into the standard
+        # prefill path. No-op if disabled or prompt has no separator.
+        try:
+            from .patches.cacheblend import try_cacheblend_prefill
+            model_settings = getattr(request, "model_settings", None)
+            if model_settings is not None:
+                try_cacheblend_prefill(
+                    request=request,
+                    model=self.model,
+                    prefix_cache=getattr(self, "block_aware_cache", None),
+                    settings=model_settings,
+                    cache=getattr(request, "prompt_cache", None),
+                )
+        except Exception:  # noqa: BLE001
+            # CacheBlend should never crash a request; fall back silently.
+            logger.exception("cacheblend pre-prefill errored; falling back")
+
         # Add to tracking
         self.requests[request.request_id] = request
         self.waiting.append(request)
