@@ -161,6 +161,70 @@ def test_patched_model_with_metadata_runs_layerwise(loaded):
         assert pos in idx_list, f"COLD token {pos} missing from recompute_indices"
 
 
+def test_check_layer_config_is_honored(loaded, monkeypatch):
+    """Setting meta.check_layer to a non-default value must route HKVD
+    scoring to that layer instead of the default layer 1.
+    """
+    model, tokenizer = loaded
+    inner = getattr(model, "model", model)
+    num_layers = len(inner.layers)
+    attn0 = inner.layers[0].self_attn
+    num_kv_heads = attn0.n_kv_heads
+    head_dim = attn0.k_proj.weight.shape[0] // num_kv_heads
+
+    observed_layers = []
+    from omlx.patches import cacheblend as cb
+    original = cb._score_hkvd_at_check_layer
+
+    def spy(layer_cache, m, layer_idx):
+        observed_layers.append(layer_idx)
+        return original(layer_cache, m, layer_idx)
+
+    monkeypatch.setattr(cb, "_score_hkvd_at_check_layer", spy)
+
+    prompt = "The sun rose over the quiet city that morning and it was still."
+    token_list = tokenizer.encode(prompt)
+    split_at = len(token_list) // 2
+    chunk_tokens = token_list[:split_at]
+    query_tokens = token_list[split_at:]
+
+    dummy = _DummyChunkHandle(num_layers, num_kv_heads, len(chunk_tokens), head_dim)
+    target_check_layer = 2  # instead of the default 1
+    meta = cacheblend.BlendMetadata(
+        chunks=[
+            cacheblend.ChunkInfo(
+                tokens=chunk_tokens, kind=cacheblend.CACHED,
+                start_pos=0, cached_kv=dummy,
+            ),
+            cacheblend.ChunkInfo(
+                tokens=query_tokens, kind=cacheblend.COLD,
+                start_pos=len(chunk_tokens), cached_kv=None,
+            ),
+        ],
+        total_len=len(token_list),
+        cold_token_mask=mx.array(
+            [False] * len(chunk_tokens) + [True] * len(query_tokens),
+            dtype=mx.bool_,
+        ),
+        check_layer=target_check_layer,
+        recompute_ratio=0.15,
+    )
+
+    cacheblend.patch_model_for_cacheblend(model)
+    cache = _make_cache(model)
+    for lc in cache:
+        lc.blend_metadata = meta
+
+    out = model(mx.array([token_list]), cache=cache)
+    mx.eval(out)
+
+    assert observed_layers == [target_check_layer], (
+        f"HKVD scorer should have been called exactly once at layer "
+        f"{target_check_layer}; got calls at layers {observed_layers}"
+    )
+    assert meta.recompute_indices is not None
+
+
 def test_patched_model_rejects_unknown_architecture():
     """Calling the patch on something that isn't LlamaModel/Qwen3Model should
     raise NotImplementedError so callers catch the mismatch loudly.
