@@ -3556,6 +3556,14 @@ class Scheduler:
                     # ALWAYS clear request entry to prevent memory leak
                     self.block_aware_cache.clear_request_entry(request_id)
 
+            # CacheBlend: commit cold chunks for future reuse.
+            if request is not None:
+                try:
+                    from .patches.cacheblend import commit_blend_cold_chunks
+                    commit_blend_cold_chunks(request, self.block_aware_cache)
+                except Exception:  # noqa: BLE001
+                    logger.exception("cacheblend: auto-warm commit failed")
+
             # Remove from running
             if request_id in self.running:
                 del self.running[request_id]

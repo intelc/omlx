@@ -126,3 +126,64 @@ def test_hook_raises_on_specprefill_conflict():
             req, model=object(), prefix_cache=prefix_cache, settings=settings,
             cache=cache,
         )
+
+
+def test_commit_blend_cold_chunks_writes_to_prefix_cache():
+    """End-to-end: metadata attached to cache, mock K/V available via .keys,
+    commit_blend_cold_chunks should submit each COLD doc chunk to the prefix
+    cache's commit_chunk_as_standalone. Query chunk is skipped.
+    """
+    meta = cacheblend.BlendMetadata(
+        chunks=[
+            cacheblend.ChunkInfo(tokens=[1, 2, 3], kind=cacheblend.COLD, start_pos=0),
+            cacheblend.ChunkInfo(tokens=[4, 5], kind=cacheblend.COLD, start_pos=3),
+            cacheblend.ChunkInfo(tokens=[9], kind=cacheblend.COLD, start_pos=5),  # query
+        ],
+        total_len=6,
+    )
+
+    class _LayerCache:
+        def __init__(self):
+            # Shape [1, num_heads=1, tokens=6, head_dim=4] — batched.
+            self.keys = mx.arange(6 * 4, dtype=mx.float32).reshape(1, 1, 6, 4)
+            self.values = -mx.arange(6 * 4, dtype=mx.float32).reshape(1, 1, 6, 4)
+
+    layer_caches = [_LayerCache(), _LayerCache()]
+    layer_caches[0].blend_metadata = meta
+
+    req = types.SimpleNamespace(cache=layer_caches)
+
+    committed_list = []
+
+    class _Prefix:
+        def commit_chunk_as_standalone(self, tokens, per_layer_kv):
+            committed_list.append((tokens, len(per_layer_kv)))
+            return True
+
+    n = cacheblend.commit_blend_cold_chunks(req, _Prefix())
+    # 2 doc chunks committed; query chunk skipped.
+    assert n == 2
+    assert committed_list == [([1, 2, 3], 2), ([4, 5], 2)]
+
+
+def test_commit_blend_cold_chunks_noop_without_metadata():
+    """No blend_metadata attached → returns 0, doesn't call prefix cache."""
+    class _LayerCache:
+        keys = mx.zeros((1, 1, 1, 1))
+        values = mx.zeros((1, 1, 1, 1))
+
+    req = types.SimpleNamespace(cache=[_LayerCache()])
+
+    class _Prefix:
+        def commit_chunk_as_standalone(self, *a, **kw):
+            raise AssertionError("should not be called")
+
+    n = cacheblend.commit_blend_cold_chunks(req, _Prefix())
+    assert n == 0
+
+
+def test_commit_blend_cold_chunks_noop_without_prefix_cache():
+    """Prefix cache None → returns 0 gracefully."""
+    req = types.SimpleNamespace(cache=[])
+    n = cacheblend.commit_blend_cold_chunks(req, None)
+    assert n == 0

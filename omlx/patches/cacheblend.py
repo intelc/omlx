@@ -629,3 +629,70 @@ def try_cacheblend_prefill(
         for layer_cache in resolved_cache:
             layer_cache.blend_metadata = meta
     return True
+
+
+# -----------------------------------------------------------------------------
+# Post-request auto-warm: commit cold chunks as standalone prefix entries
+# -----------------------------------------------------------------------------
+
+
+def commit_blend_cold_chunks(request, prefix_cache) -> int:
+    """On request finish: for each chunk that was COLD, extract its per-layer
+    K/V from the completed cache and register it as a standalone prefix so
+    later requests can reuse it. Returns the number of chunks committed.
+
+    This is the "hybrid auto-warm" path: any chunk that couldn't be looked up
+    at admission time gets cached as a side effect of the request completing.
+    The query chunk (always COLD, always last) is skipped — caching it would
+    pollute the store with non-reusable per-query content.
+
+    Non-destructive: catches and logs exceptions per-chunk so a single bad
+    chunk doesn't lose the whole opportunity. Returns the count of chunks
+    that successfully committed.
+    """
+    if prefix_cache is None:
+        return 0
+
+    cache = getattr(request, "cache", None) or getattr(request, "prompt_cache", None)
+    if cache is None:
+        return 0
+
+    meta = _get_blend_metadata(cache)
+    if meta is None:
+        return 0
+
+    num_layers = len(cache)
+    committed = 0
+    # Exclude the final chunk (the query) — always COLD, never worth caching.
+    doc_chunks = meta.chunks[:-1] if meta.chunks else []
+
+    for chunk in doc_chunks:
+        if chunk.kind != COLD:
+            continue
+
+        start, end = chunk.start_pos, chunk.start_pos + len(chunk.tokens)
+        per_layer_kv = []
+        for layer_idx in range(num_layers):
+            layer_cache = cache[layer_idx]
+            # mlx-lm KVCache stores full-sequence K/V as `.keys` / `.values`;
+            # the usable window is cache.offset (see also _score_hkvd_at_check_layer
+            # for the same slicing rationale).
+            k = getattr(layer_cache, "keys", None)
+            v = getattr(layer_cache, "values", None)
+            if k is None or v is None:
+                return committed
+            # Drop batch dim if present; slice to [start:end] at the tokens axis.
+            if k.ndim == 4:
+                k = k[0]
+                v = v[0]
+            # K/V are shape [num_heads, cache_capacity, head_dim]; slice the
+            # chunk's absolute positions.
+            per_layer_kv.append((k[:, start:end, :], v[:, start:end, :]))
+
+        try:
+            ok = prefix_cache.commit_chunk_as_standalone(chunk.tokens, per_layer_kv)
+            if ok:
+                committed += 1
+        except Exception:  # noqa: BLE001
+            logger.exception("cacheblend: failed to commit chunk on finish")
+    return committed
