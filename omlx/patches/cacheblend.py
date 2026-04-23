@@ -432,10 +432,30 @@ def _build_position_offsets(meta: BlendMetadata) -> mx.array:
     return mx.array(offsets, dtype=mx.int32)
 
 
-def _gather_cached_k(meta: BlendMetadata, layer_idx: int, head_dim: int, num_kv_heads: int) -> mx.array:
-    """Concatenate per-chunk cached K for the given layer, with per-chunk
-    offset RoPE applied. COLD chunks contribute zeros (the cold_token_mask
-    forces them to recompute regardless of K-diff).
+def _gather_cached_k(
+    meta: BlendMetadata,
+    layer_idx: int,
+    head_dim: int,
+    num_kv_heads: int,
+    rope: Optional[Any] = None,
+) -> mx.array:
+    """Concatenate per-chunk cached K for the given layer at the new
+    absolute positions.
+
+    Cached K was saved with RoPE already applied at the chunk's standalone
+    positions [0..chunk_len). To represent it at the blended sequence's
+    absolute positions [start_pos..start_pos+chunk_len), apply the model's
+    rotary again with offset=start_pos — rotation composition makes this
+    exact, including under Llama-3's scaled freqs (the scaling just
+    reshapes per-frequency rates; per-frequency composition stays linear).
+
+    `rope`: pass the attention module's rotary (`attn.rope`) when the
+    caller needs K that matches the model's own rotation convention (e.g.
+    to feed into actual attention). Pass None to fall back to the built-in
+    rotate_k_by_offsets — which uses adjacent-pair base-10000 math that
+    does NOT match Llama-3 half-and-half scaled rope, so the result is
+    only suitable for rough magnitude-based ranking (HKVD diff scoring)
+    where approximate is fine.
 
     Returns shape [num_kv_heads, total_len, head_dim].
     """
@@ -444,10 +464,13 @@ def _gather_cached_k(meta: BlendMetadata, layer_idx: int, head_dim: int, num_kv_
         n = len(chunk.tokens)
         if chunk.kind == CACHED and chunk.cached_kv is not None:
             k_chunk, _ = chunk.cached_kv.per_layer_kv[layer_idx]
-            # Cached K shape: [num_kv_heads, chunk_len, head_dim]. Rotate by
-            # the chunk's new absolute start position.
-            offsets = mx.array([chunk.start_pos] * n, dtype=mx.int32)
-            k_rot = rotate_k_by_offsets(k_chunk, offsets=offsets, head_dim=head_dim)
+            if rope is not None:
+                # Model's rotary expects [B, H, T, D]; add+drop batch dim.
+                k_rot_4d = rope(k_chunk[None, :, :, :], offset=int(chunk.start_pos))
+                k_rot = k_rot_4d[0]
+            else:
+                offsets = mx.array([chunk.start_pos] * n, dtype=mx.int32)
+                k_rot = rotate_k_by_offsets(k_chunk, offsets=offsets, head_dim=head_dim)
             pieces.append(k_rot)
         else:
             pieces.append(mx.zeros((num_kv_heads, n, head_dim)))
@@ -520,7 +543,14 @@ def _run_blended_forward(inner, inputs, cache, meta: BlendMetadata, *args, **kwa
             )
 
         if i == check_layer_idx:
-            _score_hkvd_at_check_layer(cache[i], meta, layer_idx=i)
+            # Pass the check-layer's own rotary so _gather_cached_k rotates
+            # cached K with the model's actual convention (Llama-3 scaled
+            # freqs / half-and-half layout), producing a sharper HKVD diff
+            # than our generic fallback would.
+            _score_hkvd_at_check_layer(
+                cache[i], meta, layer_idx=i,
+                rope=getattr(inner.layers[i].self_attn, "rope", None),
+            )
 
     return inner.norm(h)
 
@@ -610,13 +640,25 @@ def _sparse_layer_forward(layer, h: mx.array, mask, layer_cache, recompute_indic
     return h_mid + mlp_out_full
 
 
-def _score_hkvd_at_check_layer(layer_cache, meta: BlendMetadata, layer_idx: int) -> None:
+def _score_hkvd_at_check_layer(
+    layer_cache,
+    meta: BlendMetadata,
+    layer_idx: int,
+    rope: Optional[Any] = None,
+) -> None:
     """Read fresh K from the just-populated cache, gather cached K per-chunk
     with offset-RoPE, and store HKVD-selected indices on meta.
 
-    Caught-and-logged on failure: HKVD is instrumentation in this MVP, not a
+    Caught-and-logged on failure: HKVD is instrumentation, not a
     correctness-critical step. If it fails, the rest of the forward still
     produces correct output.
+
+    `rope`: the check layer's own rotary, if available. When provided it
+    rotates the cached K using the model's exact convention (essential
+    for Llama-3's scaled freqs / half-and-half layout). Without it we
+    fall back to a generic approximation that's close enough for rough
+    top-k ranking but would NOT be correct if the rotated K were fed
+    into downstream attention.
     """
     try:
         k_fresh = layer_cache.keys
@@ -641,7 +683,9 @@ def _score_hkvd_at_check_layer(layer_cache, meta: BlendMetadata, layer_idx: int)
             # Skip scoring rather than produce nonsense.
             return
 
-        k_cached = _gather_cached_k(meta, layer_idx, head_dim, num_kv_heads)
+        k_cached = _gather_cached_k(
+            meta, layer_idx, head_dim, num_kv_heads, rope=rope,
+        )
         indices = hkvd_score(
             k_fresh=k_fresh,
             k_cached=k_cached,

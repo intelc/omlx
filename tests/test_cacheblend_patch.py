@@ -182,9 +182,9 @@ def test_check_layer_config_is_honored(loaded, monkeypatch):
     from omlx.patches import cacheblend as cb
     original = cb._score_hkvd_at_check_layer
 
-    def spy(layer_cache, m, layer_idx):
+    def spy(layer_cache, m, layer_idx, **kwargs):
         observed_layers.append(layer_idx)
-        return original(layer_cache, m, layer_idx)
+        return original(layer_cache, m, layer_idx, **kwargs)
 
     monkeypatch.setattr(cb, "_score_hkvd_at_check_layer", spy)
 
