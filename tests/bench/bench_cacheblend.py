@@ -13,8 +13,10 @@ and prints the speedup. Ship-gate of 1.5x is INFORMATIONAL in the MVP
 from __future__ import annotations
 
 import json
+import os
 import platform
 import random
+import re
 import statistics
 import string
 import time
@@ -26,11 +28,23 @@ import mlx.core as mx
 from omlx.patches import cacheblend
 
 
-MODEL_ID = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+# Model ID can be overridden via env var, e.g.
+#   OMLX_BENCH_MODEL_ID=mlx-community/Meta-Llama-3.1-8B-Instruct-bf16 python ...
+# The default is the 1B-4bit checkpoint Task 0 pre-downloaded — cheap to run
+# and a known calibration point. Larger unquantized models move out of
+# memory-bandwidth-bound territory and show CacheBlend's real speedup.
+MODEL_ID = os.environ.get(
+    "OMLX_BENCH_MODEL_ID", "mlx-community/Llama-3.2-1B-Instruct-4bit"
+)
+# RAG-representative context: 4 chunks @ ~2K tokens each + 64-token query.
+# At ~8K total tokens, attention's O(L^2) starts dominating Q/K/V projection's
+# O(L*D^2), which is where the sparse-attention win is visible. At the
+# original 2K-nominal config attention is too small relative to projections
+# for CacheBlend's savings to show up against baseline noise.
 NUM_CHUNKS = 4
-TOKENS_PER_CHUNK = 512
+TOKENS_PER_CHUNK = 2048
 QUERY_TOKENS = 64
-RUNS = 30
+RUNS = 20
 WARMUP = 3
 RECOMPUTE_RATIO = 0.15
 
@@ -73,10 +87,9 @@ def _slice_kv(layer_cache, n):
     return k[:, :nn, :], v[:, :nn, :]
 
 
-def _prewarm(model, tokenizer, prefix_cache, doc_texts):
+def _prewarm(model, prefix_cache, doc_token_lists):
     from mlx_lm.models.cache import make_prompt_cache
-    for text in doc_texts:
-        toks = tokenizer.encode(text)
+    for toks in doc_token_lists:
         cache = make_prompt_cache(model)
         logits = model(mx.array([toks]), cache=cache)
         mx.eval(logits)
@@ -96,12 +109,12 @@ def _measure_ttft_baseline(model, prompt_token_ids):
     return time.perf_counter() - t0
 
 
-def _measure_ttft_blend(model, tokenizer, prompt_token_ids, doc_texts, query_text, prefix_cache):
+def _measure_ttft_blend(model, prompt_token_ids, doc_token_lists, query_tokens, prefix_cache):
     from mlx_lm.models.cache import make_prompt_cache
     cache = make_prompt_cache(model)
     meta = cacheblend.build_blend_metadata(
-        chunk_token_lists=[tokenizer.encode(d) for d in doc_texts],
-        query_tokens=tokenizer.encode(query_text),
+        chunk_token_lists=doc_token_lists,
+        query_tokens=query_tokens,
         prefix_cache=prefix_cache,
         chunk_min_tokens=1,
     )
@@ -126,14 +139,35 @@ def main():
     doc_texts = [_synthetic_doc(i, TOKENS_PER_CHUNK) for i in range(NUM_CHUNKS)]
     query_text = _synthetic_query(QUERY_TOKENS)
 
-    # Actual tokenized lengths (may vary from nominal).
-    doc_token_counts = [len(tokenizer.encode(d)) for d in doc_texts]
-    query_token_count = len(tokenizer.encode(query_text))
+    # Build the prompt at TOKEN level rather than string level. Plain
+    # string-split + per-chunk encode drifts by a few tokens (tokenizer
+    # prepends BOS per call, boundary merges differ in context), which
+    # misaligns the blend path's HKVD scorer and silently disables sparse.
+    # Here we concatenate pre-encoded token lists directly.
+    doc_token_lists = [tokenizer.encode(d) for d in doc_texts]
+    query_tokens_raw = tokenizer.encode(query_text)
+    # Drop BOS on non-first chunks and on the query so only one BOS lands
+    # at the very start of the assembled prompt.
+    first_tok = doc_token_lists[0][:1] if doc_token_lists and doc_token_lists[0] else []
+    bos_candidate = first_tok[0] if first_tok else None
+
+    def _strip_leading_bos(tokens):
+        if bos_candidate is not None and tokens and tokens[0] == bos_candidate:
+            return tokens[1:]
+        return tokens
+
+    # Keep chunk[0]'s BOS, strip it from everything after.
+    doc_token_lists = [doc_token_lists[0]] + [_strip_leading_bos(t) for t in doc_token_lists[1:]]
+    query_tokens = _strip_leading_bos(query_tokens_raw)
+
+    doc_token_counts = [len(t) for t in doc_token_lists]
+    query_token_count = len(query_tokens)
     print(f"  doc tokens: {doc_token_counts}, query tokens: {query_token_count}")
 
-    separator = " # # "
-    prompt = separator.join(doc_texts + [query_text])
-    prompt_token_ids = tokenizer.encode(prompt)
+    prompt_token_ids = []
+    for t in doc_token_lists:
+        prompt_token_ids.extend(t)
+    prompt_token_ids.extend(query_tokens)
     print(f"  total prompt tokens: {len(prompt_token_ids)}")
 
     # Pre-warm the prefix cache with each doc chunk as standalone.
@@ -141,7 +175,7 @@ def main():
     tmp_dir.mkdir(parents=True, exist_ok=True)
     prefix_cache = _make_prefix_cache(tmp_dir, model)
     print("Pre-warming prefix cache...")
-    _prewarm(model, tokenizer, prefix_cache, doc_texts)
+    _prewarm(model, prefix_cache, doc_token_lists)
 
     # Ensure patch is installed so no-metadata path is byte-identical (Task 9 guarantee)
     cacheblend.patch_model_for_cacheblend(model)
@@ -149,13 +183,13 @@ def main():
     print(f"\nWarmup ({WARMUP} runs each)...")
     for _ in range(WARMUP):
         _measure_ttft_baseline(model, prompt_token_ids)
-        _measure_ttft_blend(model, tokenizer, prompt_token_ids, doc_texts, query_text, prefix_cache)
+        _measure_ttft_blend(model, prompt_token_ids, doc_token_lists, query_tokens, prefix_cache)
 
     print(f"\nMeasuring baseline TTFT ({RUNS} runs)...")
     baseline = [_measure_ttft_baseline(model, prompt_token_ids) for _ in range(RUNS)]
 
     print(f"Measuring blend TTFT ({RUNS} runs)...")
-    blend = [_measure_ttft_blend(model, tokenizer, prompt_token_ids, doc_texts, query_text, prefix_cache) for _ in range(RUNS)]
+    blend = [_measure_ttft_blend(model, prompt_token_ids, doc_token_lists, query_tokens, prefix_cache) for _ in range(RUNS)]
 
     q_base = statistics.quantiles(baseline, n=4)
     q_blend = statistics.quantiles(blend, n=4)
@@ -197,7 +231,10 @@ def main():
         ),
     }
 
-    out_path = Path(__file__).parent / "bench_cacheblend_results.json"
+    # Per-model result files so runs on different checkpoints don't clobber
+    # each other. Sanitize the model ID into a safe filename fragment.
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "_", MODEL_ID)
+    out_path = Path(__file__).parent / f"bench_cacheblend_results_{safe_id}.json"
     with out_path.open("w") as f:
         json.dump(result, f, indent=2)
 
