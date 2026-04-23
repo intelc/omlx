@@ -432,6 +432,46 @@ def _build_position_offsets(meta: BlendMetadata) -> mx.array:
     return mx.array(offsets, dtype=mx.int32)
 
 
+def _gather_cached_kv(
+    meta: BlendMetadata,
+    layer_idx: int,
+    head_dim: int,
+    num_kv_heads: int,
+    rope: Optional[Any] = None,
+) -> Tuple[mx.array, mx.array]:
+    """Like _gather_cached_k but returns (K, V) together.
+
+    V has no RoPE applied (it's position-independent), so we just concatenate
+    cached V chunks as-is. K is rotated to the chunk's new absolute start
+    via the model's rotary when provided.
+
+    COLD chunks contribute zeros at their positions for both K and V. The
+    caller is responsible for overwriting those slots with freshly-projected
+    K/V before using them in attention — and since COLD positions are
+    unconditionally included in recompute_indices, that always happens.
+
+    Returns (K, V), each shape [num_kv_heads, total_len, head_dim].
+    """
+    k_pieces: List[mx.array] = []
+    v_pieces: List[mx.array] = []
+    for chunk in meta.chunks:
+        n = len(chunk.tokens)
+        if chunk.kind == CACHED and chunk.cached_kv is not None:
+            k_chunk, v_chunk = chunk.cached_kv.per_layer_kv[layer_idx]
+            if rope is not None:
+                k_rot_4d = rope(k_chunk[None, :, :, :], offset=int(chunk.start_pos))
+                k_rot = k_rot_4d[0]
+            else:
+                offsets = mx.array([chunk.start_pos] * n, dtype=mx.int32)
+                k_rot = rotate_k_by_offsets(k_chunk, offsets=offsets, head_dim=head_dim)
+            k_pieces.append(k_rot)
+            v_pieces.append(v_chunk)
+        else:
+            k_pieces.append(mx.zeros((num_kv_heads, n, head_dim)))
+            v_pieces.append(mx.zeros((num_kv_heads, n, head_dim)))
+    return mx.concatenate(k_pieces, axis=1), mx.concatenate(v_pieces, axis=1)
+
+
 def _gather_cached_k(
     meta: BlendMetadata,
     layer_idx: int,
@@ -539,7 +579,7 @@ def _run_blended_forward(inner, inputs, cache, meta: BlendMetadata, *args, **kwa
         else:
             h = _sparse_layer_forward(
                 inner.layers[i], h, _mask_for(i), cache[i],
-                meta.recompute_indices,
+                meta.recompute_indices, meta=meta, layer_idx=i,
             )
 
         if i == check_layer_idx:
@@ -596,7 +636,16 @@ def _rope_at_per_token_positions(
     return mx.concatenate([r1, r2], axis=-1)
 
 
-def _sparse_layer_forward(layer, h: mx.array, mask, layer_cache, recompute_indices: mx.array) -> mx.array:
+def _sparse_layer_forward(
+    layer,
+    h: mx.array,
+    mask,
+    layer_cache,
+    recompute_indices: mx.array,
+    *,
+    meta: Optional[BlendMetadata] = None,
+    layer_idx: int = 0,
+) -> mx.array:
     """Transformer-block forward with sparse attention + sparse MLP.
 
     The selected `recompute_indices` positions get the full block treatment
@@ -619,7 +668,12 @@ def _sparse_layer_forward(layer, h: mx.array, mask, layer_cache, recompute_indic
     n_sel = recompute_indices.shape[0]
 
     # --- K/V: full-width projections (cache needs K/V at every position so
-    # downstream layers and decode continuations can attend correctly) ---
+    # downstream layers and decode continuations can attend correctly).
+    # Sparse K/V projection was attempted — it worked for correctness but
+    # the overhead of per-chunk cached-K offset-rope assembly + axis-2
+    # advanced-index assignment into the full cache matched or exceeded
+    # the projection savings on mlx's current scatter implementation, so
+    # we keep K/V dense here. See git log for the sparse-K/V experiment. ---
     x_ln = layer.input_layernorm(h)
     k = attn.k_proj(x_ln)
     v = attn.v_proj(x_ln)
@@ -631,21 +685,14 @@ def _sparse_layer_forward(layer, h: mx.array, mask, layer_cache, recompute_indic
     k = attn.rope(k, offset=layer_cache.offset)
     keys, values = layer_cache.update_and_fetch(k, v)
 
-    # --- Q: sparse projection when we can rotate by per-token positions. ---
+    # --- Q: sparse projection when we can rotate by per-token positions.
     # Q is only consumed at the selected rows, so projecting only on the
-    # selected input slice shrinks this step from O(L*D^2) to O(|I|*D^2).
-    # The fallback path (dense Q projection + slice) runs when the rope
-    # doesn't expose its inv-freqs — we keep it for rope variants we
-    # haven't validated per-token rotation against.
+    # selected input slice shrinks Q from O(L*D^2) to O(|I|*D^2). The
+    # fallback path (dense Q projection + slice) runs when the rope
+    # doesn't expose its inv-freqs. ---
     rope_freqs = getattr(attn.rope, "_freqs", None)
     rope_traditional = getattr(attn.rope, "traditional", False)
     sel_positions = recompute_indices.astype(mx.int32) + layer_cache.offset - L
-    # Important: layer_cache.offset is now L after update_and_fetch above.
-    # Subtracting L gives positions relative to prefill start, then adding
-    # back layer_cache.offset - L (= 0 on a fresh prefill) — in other words
-    # at the clean prefill case `sel_positions == recompute_indices`. The
-    # arithmetic stays correct under a decode continuation too (offset > L
-    # shifts the selected positions into the global stream).
     if rope_freqs is not None:
         h_sel = h[:, recompute_indices, :]                           # [B, n_sel, D]
         x_ln_sel = layer.input_layernorm(h_sel)
