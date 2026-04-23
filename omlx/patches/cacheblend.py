@@ -505,13 +505,109 @@ def _run_blended_forward(inner, inputs, cache, meta: BlendMetadata, *args, **kwa
             f"{num_layers}-layer model"
         )
 
+    # Layers 0..check_layer run dense (need full cache for HKVD and to
+    # produce a correct residual stream up to scoring). Layers after
+    # check_layer run sparsely when HKVD produced indices: only the
+    # selected positions do the full attention + MLP; non-selected rows
+    # keep their pre-layer hidden state unchanged.
     for i in range(num_layers):
-        h = inner.layers[i](h, _mask_for(i), cache=cache[i])
+        if i <= check_layer_idx or meta.recompute_indices is None:
+            h = inner.layers[i](h, _mask_for(i), cache=cache[i])
+        else:
+            h = _sparse_layer_forward(
+                inner.layers[i], h, _mask_for(i), cache[i],
+                meta.recompute_indices,
+            )
 
         if i == check_layer_idx:
             _score_hkvd_at_check_layer(cache[i], meta, layer_idx=i)
 
     return inner.norm(h)
+
+
+def _sparse_layer_forward(layer, h: mx.array, mask, layer_cache, recompute_indices: mx.array) -> mx.array:
+    """Transformer-block forward with sparse attention + sparse MLP.
+
+    The selected `recompute_indices` positions get the full block treatment
+    (attention against the freshly-populated cache, MLP update, residual add).
+    Non-selected positions pass through unchanged — their hidden state is
+    the pre-layer residual. This is CacheBlend's core approximation: once
+    HKVD says "these tokens' K changed the most," the other tokens'
+    downstream updates are near-enough unchanged that skipping them is OK.
+
+    Speedup sources:
+    - Q/K/V projections stay dense (needed for cache correctness on
+      downstream layers), so those L-linear ops are unchanged.
+    - Attention goes from O(L^2) to O(|I|*L).
+    - o_proj and MLP operate only on |I| selected rows.
+
+    Assumptions: B=1 (matches the rest of the blend path).
+    """
+    attn = layer.self_attn
+    B, L, D = h.shape
+    n_sel = recompute_indices.shape[0]
+
+    # --- Full-width projections + RoPE (kept dense for cache correctness) ---
+    x_ln = layer.input_layernorm(h)
+    q = attn.q_proj(x_ln)
+    k = attn.k_proj(x_ln)
+    v = attn.v_proj(x_ln)
+
+    # Qwen3 applies q_norm/k_norm between reshape and transpose; Llama doesn't.
+    if hasattr(attn, "q_norm"):
+        q = attn.q_norm(q.reshape(B, L, attn.n_heads, -1)).transpose(0, 2, 1, 3)
+        k = attn.k_norm(k.reshape(B, L, attn.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+    else:
+        q = q.reshape(B, L, attn.n_heads, -1).transpose(0, 2, 1, 3)
+        k = k.reshape(B, L, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+    v = v.reshape(B, L, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+    q = attn.rope(q, offset=layer_cache.offset)
+    k = attn.rope(k, offset=layer_cache.offset)
+
+    # Populate the cache with fresh K/V at all positions — the downstream
+    # layers read this, and any future decode continuation needs it too.
+    keys, values = layer_cache.update_and_fetch(k, v)
+
+    # --- Sparse attention: Q[I] @ K_full, V_full, causal at absolute pos ---
+    q_sel = q[:, :, recompute_indices, :]               # [B, n_heads, n_sel, head_dim]
+
+    # Causal mask at absolute positions: row j (Q at recompute_indices[j])
+    # may attend to K columns up to recompute_indices[j].
+    T = keys.shape[2]
+    positions = mx.arange(T, dtype=mx.int32)
+    sel_pos = recompute_indices.astype(mx.int32)[:, None]
+    allow = positions[None, :] <= sel_pos               # [n_sel, T]
+    add_mask = mx.where(
+        allow, mx.array(0.0, dtype=q.dtype), mx.array(-1e9, dtype=q.dtype)
+    )                                                    # [n_sel, T]
+
+    # Fused attention kernel. mx.fast.SDPA handles GQA (keys/values with
+    # fewer heads) natively; we pass arrays at their native head counts.
+    out_sel = mx.fast.scaled_dot_product_attention(
+        q_sel, keys, values, scale=attn.scale, mask=add_mask,
+    )                                                    # [B, n_heads, n_sel, head_dim]
+
+    # --- o_proj: dense at selected rows, zeros elsewhere ---
+    out_sel_flat = out_sel.transpose(0, 2, 1, 3).reshape(B, n_sel, -1)
+    o_sel = attn.o_proj(out_sel_flat)                             # [B, n_sel, D]
+
+    # Scatter o_sel into a full-width zero tensor; non-selected rows remain 0
+    # so the residual add below leaves them untouched.
+    attn_out_full = mx.zeros((B, L, D), dtype=o_sel.dtype)
+    attn_out_full[:, recompute_indices, :] = o_sel
+
+    h_mid = h + attn_out_full
+
+    # --- MLP: only at selected rows, scattered back ---
+    mlp_in = layer.post_attention_layernorm(h_mid)
+    mlp_in_sel = mlp_in[:, recompute_indices, :]                   # [B, n_sel, D]
+    mlp_out_sel = layer.mlp(mlp_in_sel)                            # [B, n_sel, D]
+
+    mlp_out_full = mx.zeros((B, L, D), dtype=mlp_out_sel.dtype)
+    mlp_out_full[:, recompute_indices, :] = mlp_out_sel
+
+    return h_mid + mlp_out_full
 
 
 def _score_hkvd_at_check_layer(layer_cache, meta: BlendMetadata, layer_idx: int) -> None:

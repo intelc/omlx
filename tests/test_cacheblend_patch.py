@@ -145,10 +145,16 @@ def test_patched_model_with_metadata_runs_layerwise(loaded):
     assert out_blend.shape == out_baseline.shape
     assert not mx.any(mx.isnan(out_blend)).item(), "blend forward produced NaN logits"
 
-    # MVP full-recompute: output must be bit-identical to baseline, because
-    # meta plumbing doesn't alter the actual math.
-    assert mx.allclose(out_blend, out_baseline, atol=1e-5).item(), (
-        "Blend forward (full-recompute MVP) must match baseline logits exactly."
+    # Sparse forward is an approximation — it skips updates at non-selected
+    # positions. So output is NOT bit-identical to the baseline, but it must
+    # stay finite and in a sane magnitude range. The E2E correctness tests
+    # (tests/test_cacheblend_correctness.py) verify semantic quality on real
+    # RAG prompts; here we just guard against explosion / NaN.
+    blend_max = float(mx.max(mx.abs(out_blend)).item())
+    base_max = float(mx.max(mx.abs(out_baseline)).item())
+    assert blend_max < 10 * base_max + 1e-3, (
+        f"Blend output magnitude exploded: blend_max={blend_max}, "
+        f"baseline_max={base_max}"
     )
 
     # HKVD must have populated recompute_indices.

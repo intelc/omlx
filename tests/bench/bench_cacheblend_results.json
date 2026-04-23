@@ -19,18 +19,18 @@
     "recompute_ratio": 0.15
   },
   "baseline_ttft_s": {
-    "median": 1.3552088130090851,
-    "iqr": 0.2358111049834406,
-    "min": 1.0640874590026215,
-    "max": 1.484811665955931
+    "median": 1.5508586664800532,
+    "iqr": 0.33494255143159535,
+    "min": 1.2009677910245955,
+    "max": 1.8584313329774886
   },
   "blend_ttft_s": {
-    "median": 1.373359833523864,
-    "iqr": 0.05115345821832307,
-    "min": 1.3214642080129124,
-    "max": 1.442979458021
+    "median": 1.5335288960195612,
+    "iqr": 0.35199861429282464,
+    "min": 1.3051094170077704,
+    "max": 2.597141875012312
   },
-  "speedup_x": 0.9867834925183405,
+  "speedup_x": 1.0113005829270472,
   "ship_gate_threshold": 1.5,
   "ship_gate_pass": false,
   "mvp_note": "Current patch is full-recompute (layerwise plumbing only); sparse-attention optimization is a follow-up. Speedup near 1.0x is expected; gate failure informs that follow-up work."
