@@ -1,0 +1,9 @@
+{
+  "separator": " # # ",
+  "docs": [
+    "The Golden Gate Bridge is a suspension bridge in San Francisco, California. It was opened in 1937.",
+    "Mount Everest is the highest mountain above sea level. Its peak is at 8,848 metres.",
+    "The Pacific Ocean is the largest and deepest of Earth's oceans."
+  ],
+  "query": "Which of the three facts above mentions a year?"
+}
